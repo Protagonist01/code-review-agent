@@ -26,6 +26,7 @@ Listens for GitHub PR events → parses diffs → runs LLM review → posts inli
 ## Table of Contents
 
 - [Overview](#overview)
+- [Why I Built This](#why-i-built-this)
 - [What It Does](#what-it-does)
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
@@ -50,6 +51,14 @@ Most AI code review tools send your code to a third-party API. This project take
 | 🏢 Enterprise | OpenAI / Anthropic / Groq | Vendor ToS applies | API key only |
 
 The engineering focus here was on the surrounding system: HMAC-authenticated webhooks, async job processing via Celery + Redis, a LangGraph state machine for the review pipeline, structured output parsing, and a Prometheus/Grafana observability stack.
+
+---
+
+## Why I Built This
+
+I built this project to explore what a production-style AI code review system looks like beyond the prompt itself. The goal was not just to call an LLM, but to design the infrastructure around it: GitHub App authentication, secure webhook handling, async review jobs, structured review output, commit statuses, observability, and provider flexibility.
+
+The project also reflects a practical concern: teams should be able to choose where their code goes. OpenRouter keeps demos fast and accessible, while Ollama gives a privacy-first path for sensitive repositories. That trade-off is the core identity of the project: useful automated review, without locking the workflow to one AI vendor.
 
 ---
 
