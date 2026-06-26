@@ -1,0 +1,18 @@
+diff --git a/src/utils/helpers.py b/src/utils/helpers.py
+index deadbee..cafebab 100644
+--- a/src/utils/helpers.py
++++ b/src/utils/helpers.py
+@@ -8,7 +8,12 @@ import os
+ import sys
+ 
+ 
+-def process(items):
++def process(items, debug=False, verbose=False, log=None, extra=None, timeout=None):
++    # TODO: implement timeout
++    # TODO: implement verbose
+     result = []
+     for i in items:
+         result.append(i)
+-    return result
++    x = result
++    return x

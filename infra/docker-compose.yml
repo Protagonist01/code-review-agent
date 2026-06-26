@@ -1,0 +1,133 @@
+# docker-compose.yml
+# Note: For production, replace python:3.11-slim images with a proper Dockerfile.
+# Build context Dockerfile is expected at repo root.
+
+networks:
+  review-net:
+    driver: bridge
+
+x-app-image: &app-image
+  image: code-review-agent:local
+  build:
+    context: ..
+    dockerfile: infra/Dockerfile
+
+services:
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: cra-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    networks:
+      - review-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── API ────────────────────────────────────────────────────────────────────
+  api:
+    <<: *app-image
+    container_name: cra-api
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ..:/app
+    command: uvicorn src.api.app:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - review-net
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3).read()\"",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ── Celery Worker ─────────────────────────────────────────────────────────
+  worker:
+    <<: *app-image
+    container_name: cra-worker
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ..:/app
+    command: celery -A src.worker.celery_app worker --loglevel=info --queues=reviews
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - review-net
+
+  # ── Flower (Celery monitoring) ─────────────────────────────────────────────
+  flower:
+    <<: *app-image
+    container_name: cra-flower
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ..:/app
+    command: celery --broker=redis://redis:6379/0 -A src.worker.celery_app flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+      - worker
+    networks:
+      - review-net
+
+  # ── Prometheus ─────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: cra-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    depends_on:
+      - api
+    networks:
+      - review-net
+
+  # ── Grafana ────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: cra-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/dashboard.json:/var/lib/grafana/dashboards/dashboard.json:ro
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - review-net

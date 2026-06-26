@@ -1,0 +1,14 @@
+diff --git a/src/calculator.py b/src/calculator.py
+index 8a3b2c1..f4e9d87 100644
+--- a/src/calculator.py
++++ b/src/calculator.py
+@@ -15,6 +15,9 @@ class Calculator:
+ 
+     def divide(self, a: float, b: float) -> float:
+         """Divide a by b."""
+-        return a / b
++        if b == 0:
++            return None  # should raise ZeroDivisionError
++        return a / b
+ 
+     def power(self, base: float, exp: float) -> float:

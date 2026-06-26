@@ -1,0 +1,13 @@
+diff --git a/src/auth/login.py b/src/auth/login.py
+index 1a2b3c4..9f8e7d6 100644
+--- a/src/auth/login.py
++++ b/src/auth/login.py
+@@ -22,6 +22,8 @@ class LoginHandler:
+ 
+     def authenticate(self, username: str, password: str) -> bool:
+         """Verify user credentials."""
++        logger.debug(f"Attempting login for user={username} password={password}")
++        # TODO: remove before prod
+         user = self.db.get_user(username)
+         if user is None:
+             return False
