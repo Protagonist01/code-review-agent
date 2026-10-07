@@ -1,15 +1,25 @@
+FROM ghcr.io/astral-sh/uv:0.11.1 AS uv
+FROM python:3.11-slim AS builder
+
+COPY --from=uv /uv /usr/local/bin/uv
+WORKDIR /app
+COPY pyproject.toml uv.lock README.md LICENSE ./
+COPY src ./src
+RUN uv sync --locked --no-dev --no-editable --no-cache
+
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_DEFAULT_TIMEOUT=120 \
-    PIP_RETRIES=10
+    PATH="/app/.venv/bin:$PATH"
+
+LABEL org.opencontainers.image.source="https://github.com/Protagonist01/code-review-agent" \
+      org.opencontainers.image.licenses="MIT"
 
 WORKDIR /app
 
-COPY pyproject.toml README.md ./
-COPY src ./src
-
-RUN python -m pip install --upgrade pip \
-    && python -m pip install --no-cache-dir -e .
-
+COPY --from=builder /app/.venv /app/.venv
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
+EXPOSE 8000
+CMD ["uvicorn", "src.api.app:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -6,14 +6,10 @@ Run with Uvicorn::
 
     uvicorn src.api.app:app --host 0.0.0.0 --port 8000
 
-Or via the project CLI::
-
-    python -m src.api.app
-
 Public helpers
 --------------
 * :func:`create_app` — construct and configure a :class:`fastapi.FastAPI`
-  instance (used by tests to get a fresh app without global state).
+  instance (used by tests to get a fresh app instance).
 * :func:`get_redis` — return the module-level Redis client initialised during
   lifespan startup; raises if called before the app has started.
 * ``app`` — the pre-built application instance used by Uvicorn / Gunicorn.
@@ -39,13 +35,13 @@ from src.config import settings
 log = structlog.get_logger()
 
 # Module-level Redis client — initialised in ``lifespan``, closed on shutdown.
-_redis: aioredis.Redis[str] | None = None
+_redis: aioredis.Redis | None = None
 
 
 # ── Redis accessor ────────────────────────────────────────────────────────────
 
 
-def get_redis() -> aioredis.Redis[str]:
+def get_redis() -> aioredis.Redis:
     """Return the shared async Redis client.
 
     Returns:
@@ -115,14 +111,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     owns_redis = _redis is None
     if owns_redis:
-        _redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+        _redis = aioredis.Redis.from_url(settings.redis_url, decode_responses=True)
     log.info("app.started", host=settings.api_host, port=settings.api_port)
 
-    yield  # ← application is running
-
-    if owns_redis and _redis is not None:
-        await _redis.close()
-    log.info("app.shutdown")
+    try:
+        yield
+    finally:
+        if owns_redis and _redis is not None:
+            await _redis.aclose()
+            _redis = None
+        log.info("app.shutdown")
 
 
 # ── Application factory ───────────────────────────────────────────────────────
@@ -147,7 +145,7 @@ def create_app() -> FastAPI:
     """
     app = FastAPI(
         title="AI Code Review Agent",
-        description="Autonomous GitHub PR reviewer powered by open-weight LLMs",
+        description="GitHub PR reviewer with configurable local or hosted inference",
         version="0.1.0",
         lifespan=lifespan,
         docs_url="/docs",
@@ -167,6 +165,15 @@ def create_app() -> FastAPI:
     async def health() -> dict[str, str]:
         """Kubernetes/Docker liveness probe — always returns 200 OK."""
         return {"status": "ok"}
+
+    @app.get("/ready", tags=["ops"])
+    async def ready() -> PlainTextResponse:
+        """Check API-to-Redis connectivity; workers and providers are separate checks."""
+        try:
+            await get_redis().ping()
+        except Exception:
+            return PlainTextResponse("Redis unavailable", status_code=503)
+        return PlainTextResponse("ready")
 
     @app.get("/metrics", response_class=PlainTextResponse, tags=["ops"])
     async def metrics() -> str:

@@ -12,3 +12,13 @@ tools
 __pycache__
 *.pyc
 
+
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
+docs
+tests
+evals

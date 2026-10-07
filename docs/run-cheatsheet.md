@@ -1,202 +1,61 @@
-# Run Cheat Sheet
+# Run cheat sheet
 
-Use these commands from the project root:
+Run commands from the cloned repository root. Configure `.env` and `keys/private-key.pem` using the README before starting real reviews.
 
-```powershell
-cd "D:\document\dev\work\portfolio projects\code-review-agent"
+## Offline demo
+
+```bash
+uv sync --locked --extra dev
+uv run --locked code-review-demo
 ```
 
-## Start The App
+No Docker, provider key, or GitHub App is needed. Model output is recorded.
 
-Build and start everything:
+## Start, inspect, and stop
 
-```powershell
-docker compose -f infra\docker-compose.yml up --build
+```bash
+docker compose --env-file .env -f infra/docker-compose.yml up --build -d redis api worker
+docker compose --env-file .env -f infra/docker-compose.yml ps
+docker compose --env-file .env -f infra/docker-compose.yml logs -f api worker
+docker compose --env-file .env -f infra/docker-compose.yml restart worker
+docker compose --env-file .env -f infra/docker-compose.yml down
 ```
 
-Start in the background instead:
+`down` keeps Redis data. Adding `-v` deletes volumes and queued work; use that only when deliberately resetting the pilot.
 
-```powershell
-docker compose -f infra\docker-compose.yml up -d --build
-```
-
-Check containers:
-
-```powershell
-docker compose -f infra\docker-compose.yml ps
-```
-
-Check the API health endpoint:
+In PowerShell, check API liveness and Redis connectivity:
 
 ```powershell
 Invoke-RestMethod http://localhost:8000/health
+Invoke-RestMethod http://localhost:8000/ready
 ```
 
-Expected response:
+## Optional monitoring
 
-```json
-{"status":"ok"}
+Set `GRAFANA_ADMIN_PASSWORD` to a strong value in `.env`, then:
+
+```bash
+docker compose --env-file .env -f infra/docker-compose.yml --profile monitoring up -d
 ```
 
-## Expose The Local API To GitHub
+| Service | Local URL |
+| --- | --- |
+| API documentation | http://localhost:8000/docs |
+| API metrics | http://localhost:8000/metrics |
+| Flower | http://localhost:5555 |
+| Prometheus | http://localhost:9090 |
+| Grafana | http://localhost:3000 |
 
-In a second terminal, start Cloudflare Tunnel:
+Grafana login is `admin` with your configured password. Worker panels require separate metrics collection; see the deployment notes.
 
-```powershell
-.\tools\cloudflared.exe tunnel --url http://localhost:8000
+## Local webhook delivery
+
+Install tunnel software separately. For example, with `cloudflared` on your PATH:
+
+```bash
+cloudflared tunnel --url http://localhost:8000
 ```
 
-Copy the generated `https://...trycloudflare.com` URL.
+Configure the GitHub App webhook URL as `https://YOUR_TUNNEL/webhook`. Temporary tunnel URLs change on restart. A tunnel can expose every API route; use only for local tests and stop it afterward. Public pilots need controlled ingress as described in [deployment.md](deployment.md).
 
-Use this webhook URL in the GitHub App settings:
-
-```text
-https://<your-trycloudflare-url>/webhook
-```
-
-The quick tunnel URL changes every time you restart `cloudflared`.
-
-## Useful Local URLs
-
-API health:
-
-```text
-http://localhost:8000/health
-```
-
-API metrics:
-
-```text
-http://localhost:8000/metrics
-```
-
-Flower Celery dashboard:
-
-```text
-http://localhost:5555
-```
-
-Prometheus:
-
-```text
-http://localhost:9090
-```
-
-Grafana:
-
-```text
-http://localhost:3000
-```
-
-Grafana login:
-
-```text
-admin / admin
-```
-
-## Watch Logs
-
-All services:
-
-```powershell
-docker compose -f infra\docker-compose.yml logs -f
-```
-
-API and worker only:
-
-```powershell
-docker compose -f infra\docker-compose.yml logs -f api worker
-```
-
-Recent review-related logs:
-
-```powershell
-docker compose -f infra\docker-compose.yml logs --since=10m api worker |
-  Select-String -Pattern "webhook|review|github_auth|llm|status|ERROR|Exception"
-```
-
-## Trigger A Test Review
-
-1. Keep Docker running.
-2. Keep Cloudflare Tunnel running.
-3. Confirm the GitHub App webhook points to the current tunnel URL.
-4. Open or update a pull request in an installed repository.
-5. Watch the GitHub App "Recent Deliveries" page.
-6. Watch local logs:
-
-```powershell
-docker compose -f infra\docker-compose.yml logs -f api worker
-```
-
-A healthy review usually includes:
-
-```text
-webhook.received
-github_auth.installation_token_issued
-llm_backend.init provider=openrouter
-github_client.review_posted
-github_client.status_set state=success
-review.complete
-```
-
-## Shut Down
-
-If Docker Compose is running in the foreground, press:
-
-```text
-Ctrl+C
-```
-
-If Docker Compose is running in the background:
-
-```powershell
-docker compose -f infra\docker-compose.yml down
-```
-
-Stop Cloudflare Tunnel by pressing:
-
-```text
-Ctrl+C
-```
-
-## Hard Reset Local Containers
-
-Use this when you want to remove containers and networks:
-
-```powershell
-docker compose -f infra\docker-compose.yml down
-```
-
-Use this only when you also want to remove Docker volumes:
-
-```powershell
-docker compose -f infra\docker-compose.yml down -v
-```
-
-## Common Fixes
-
-Rebuild after dependency or Dockerfile changes:
-
-```powershell
-docker compose -f infra\docker-compose.yml up -d --build --force-recreate
-```
-
-Restart only the worker:
-
-```powershell
-docker compose -f infra\docker-compose.yml restart worker
-```
-
-Restart only the API:
-
-```powershell
-docker compose -f infra\docker-compose.yml restart api
-```
-
-If GitHub delivery is green but no review appears, check worker logs first:
-
-```powershell
-docker compose -f infra\docker-compose.yml logs --since=10m worker
-```
-
-If the tunnel URL changed, update the GitHub App webhook URL before redelivering events.
+Open or update a PR in your authorized test repository. A 202 webhook response means a job was queued. Confirm the review and commit status on GitHub and inspect worker logs; a green webhook delivery alone does not prove review completion.

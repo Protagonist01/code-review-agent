@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 from typing import Any, Literal, cast
 
 import httpx
@@ -207,6 +209,29 @@ class GitHubClient:
             "event": "COMMENT",  # APPROVE, REQUEST_CHANGES, or COMMENT
             "comments": inline,
         }
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=True).encode()
+        ).hexdigest()
+        marker = f"<!-- code-review-agent:{digest} -->"
+        page = 1
+        while True:
+            existing = await http.get(
+                f"/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+                params={"per_page": 100, "page": page},
+            )
+            existing.raise_for_status()
+            reviews = existing.json()
+            if any(
+                review.get("commit_id") == commit_sha
+                and review.get("state") != "PENDING"
+                and marker in (review.get("body") or "")
+                for review in reviews
+            ):
+                return
+            if len(reviews) < 100:
+                break
+            page += 1
+        payload["body"] = f"{body}\n\n{marker}"
         r = await http.post(
             f"/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
             json=payload,

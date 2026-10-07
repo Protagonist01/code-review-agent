@@ -145,11 +145,11 @@ async def test_hunk_header_preserved():
 
 
 @pytest.mark.asyncio
-async def test_oversized_diff_truncated(monkeypatch):
-    """Diffs exceeding max_diff_lines should be truncated or skipped gracefully."""
+async def test_oversized_diff_fails_explicitly(monkeypatch):
+    """Diffs exceeding max_diff_lines must not produce a clean review."""
     from src.config import settings
+
     monkeypatch.setattr(settings, "max_diff_lines", 2)
     state = {"raw_diff": SIMPLE_DIFF}
-    # Should not raise; may return empty or partial hunks
-    result = await diff_parser(state)
-    assert "hunks" in result
+    with pytest.raises(ValueError, match="MAX_DIFF_LINES"):
+        await diff_parser(state)

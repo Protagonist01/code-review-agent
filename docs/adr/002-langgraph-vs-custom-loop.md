@@ -1,32 +1,24 @@
-# ADR-002: Use LangGraph Instead of a Custom Agent Loop
+# ADR-002: Model the review pipeline with LangGraph
 
 ## Status
-Accepted
+
+Accepted.
 
 ## Context
-The review agent needs to execute a multi-step pipeline: parse diff → fetch context → build prompt → call LLM → parse response → post comments. This could be implemented as a plain Python function calling each step sequentially.
 
-The question was whether to introduce LangGraph (a graph-based agent framework) or keep a simple imperative loop.
+The review pipeline has distinct steps with explicit inputs and outputs. A plain sequence of async function calls could implement the current linear flow. Named graph nodes make each stage independently testable and provide a shared typed state representation.
 
 ## Decision
-Use **LangGraph** to model the agent as an explicit state machine with named nodes and typed state transitions.
+
+Use a LangGraph `StateGraph` with `ReviewState`: diff parsing, repository context, prompt validation, model review, response filtering, and summary generation. The worker fetches the diff and publishes the result outside the graph.
+
+The current graph is linear. Retries happen at the Celery task level, not through conditional graph edges. Graph construction can omit remote context and accept an injected backend for isolated evaluations and the offline demo. Streaming, checkpoints, and conditional retry branches are possible future capabilities, not implemented features.
 
 ## Consequences
 
-**Gained:**
-- Each node (`diff_parser`, `context_fetcher`, `prompt_builder`, etc.) is independently testable — you can unit test a node by passing it a state dict and asserting the output
-- State is an explicit typed dict, not implicit function arguments — easier to inspect and log at each step
-- Conditional edges make branching logic (e.g., skip context fetch for small diffs) readable and auditable
-- LangGraph's built-in streaming allows per-node progress events — useful for the future dashboard
-- Signals familiarity with the modern agent framework ecosystem to reviewers
+- Stages can be tested with small state dictionaries and model fixtures.
+- The dependency and graph API add complexity compared with a plain async function.
+- The named stages and explicit state help readers inspect the pipeline and replace a stage without changing the worker contract.
+- There is no durable graph checkpoint; a task retry repeats analysis.
 
-**Trade-offs:**
-- Adds a dependency (`langgraph`) for what could be a 50-line sequential function
-- Learning curve for contributors unfamiliar with graph-based agents
-- Slight overhead from state serialization between nodes
-
-**Why not LangChain LCEL or a plain chain?**
-LCEL chains are linear. The review pipeline has conditional paths (retry on parse failure, skip hunks below a size threshold) that are cleaner to express as graph edges than nested conditionals inside a chain.
-
-**Mitigation:**
-`docs/architecture.md` includes a visual of the graph with node descriptions so contributors can understand the flow without reading LangGraph docs first.
+The plain-function alternative remains reasonable for a small linear pipeline. LangGraph was retained to make stage boundaries explicit and leave room for future branching. See [architecture](../architecture.md) for the implemented topology.

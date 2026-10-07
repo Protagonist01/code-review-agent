@@ -58,7 +58,7 @@ def _load_template() -> tuple[str, str]:
 
     # Strip the leading "SYSTEM:\n" marker
     if system_section.startswith("SYSTEM:\n"):
-        system_section = system_section[len("SYSTEM:\n"):]
+        system_section = system_section[len("SYSTEM:\n") :]
 
     return system_section.strip(), user_template.strip()
 

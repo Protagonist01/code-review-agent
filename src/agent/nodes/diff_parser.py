@@ -224,7 +224,7 @@ async def diff_parser(state: ReviewState) -> dict[str, list[DiffHunk]]:
         log.warning("diff_parser.empty_diff", owner=state.get("owner"), repo=state.get("repo"))
         return {"hunks": []}
 
-    line_count = raw_diff.count("\n")
+    line_count = len(raw_diff.splitlines())
     if line_count > settings.max_diff_lines:
         log.warning(
             "diff_parser.diff_too_large",
@@ -234,7 +234,7 @@ async def diff_parser(state: ReviewState) -> dict[str, list[DiffHunk]]:
             repo=state.get("repo"),
             pr_number=state.get("pr_number"),
         )
-        return {"hunks": []}
+        raise ValueError("Diff exceeds MAX_DIFF_LINES; review incomplete")
 
     hunks = _parse_diff(raw_diff)
 

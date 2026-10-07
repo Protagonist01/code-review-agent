@@ -1,308 +1,128 @@
-<div align="center">
+# AI Code Review Agent
 
-# 🤖 AI Code Review Agent
+A self-hosted GitHub App that turns pull-request diffs into inline review comments, a summary, and a commit status. Built with **Python, FastAPI, Celery, Redis, and LangGraph**, with five interchangeable model providers.
 
-**Autonomous, privacy-first AI code review that runs on your infrastructure.**
+**Project status: experimental portfolio project.** Automated checks validate the software with mocked services. Live review quality and production recovery still need validation. AI feedback supplements human review and tests.
 
-Listens for GitHub PR events → parses diffs → runs LLM review → posts inline comments, summary, and commit status — all without sending code anywhere you don't control.
+## Why I built this
 
-<br/>
+I built this project to explore the engineering around an AI reviewer: secure webhook handling, GitHub App authentication, background jobs, structured model output, and provider choice. The interesting work is making the service handle failures clearly and keeping the choice of where code is processed explicit.
 
-[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.111+-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
-[![LangGraph](https://img.shields.io/badge/LangGraph-0.2+-FF6F00?style=flat-square&logo=langchain&logoColor=white)](https://langchain-ai.github.io/langgraph/)
-[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
-[![Coverage](https://img.shields.io/badge/Coverage-≥80%25-4CAF50?style=flat-square)](https://pytest-cov.readthedocs.io/)
+## Explore in five minutes
 
-</div>
+- [Architecture and trade-offs](docs/architecture.md): responsibilities, failure paths, and design decisions.
+- [Offline demo](#run-the-offline-demo): inspect a sample diff and its review without credentials.
+- [Review worker](src/worker.py), [webhook receiver](src/api/webhook.py), and [pipeline](src/agent/graph.py): the main implementation.
+- [Tests](tests/) and [CI configuration](.github/workflows/ci.yml): verification, packaging, and container checks.
+- [Readiness assessment](docs/readiness-assessment.md): verified evidence and remaining gaps.
 
----
+## How it works
 
-![demo](docs/assets/demo.gif)
-
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Why I Built This](#why-i-built-this)
-- [What It Does](#what-it-does)
-- [Architecture](#architecture)
-- [Quick Start](#quick-start)
-- [LLM Backend Options](#llm-backend-options)
-- [How It Works](#how-it-works)
-- [Testing](#testing)
-- [Evaluation](#evaluation)
-- [Monitoring](#monitoring)
-- [Project Structure](#project-structure)
-- [Limitations & Roadmap](#limitations--roadmap)
-
----
-
-## Overview
-
-Most AI code review tools send your code to a third-party API. This project takes a different approach: **the backend is swappable**, so you choose where your code goes.
-
-| Path | Provider | Privacy | Setup |
-|---|---|---|---|
-| ⚡ Quick start | OpenRouter (free) | Code leaves machine | 2 mins |
-| 🔒 Private | Ollama (local) | Zero code egress | Requires GPU/CPU |
-| 🏢 Enterprise | OpenAI / Anthropic / Groq | Vendor ToS applies | API key only |
-
-The engineering focus here was on the surrounding system: HMAC-authenticated webhooks, async job processing via Celery + Redis, a LangGraph state machine for the review pipeline, structured output parsing, and a Prometheus/Grafana observability stack.
-
----
-
-## Why I Built This
-
-I built this project to explore what a production-style AI code review system looks like beyond the prompt itself. The goal was not just to call an LLM, but to design the infrastructure around it: GitHub App authentication, secure webhook handling, async review jobs, structured review output, commit statuses, observability, and provider flexibility.
-
-The project also reflects a practical concern: teams should be able to choose where their code goes. OpenRouter keeps demos fast and accessible, while Ollama gives a privacy-first path for sensitive repositories. That trade-off is the core identity of the project: useful automated review, without locking the workflow to one AI vendor.
-
----
-
-## What It Does
-
-- 📥 **Ingests** GitHub PR `opened` / `synchronize` webhook events (HMAC-signed)
-- 🔪 **Parses** the unified diff into isolated hunks with file + line context
-- 🌳 **Fetches** repo context (README, file tree, detected language) to ground reviews
-- 🧠 **Reviews** each hunk via the configured LLM backend — bugs, security issues, style violations
-- 💬 **Posts inline comments** at the exact file + line position on the PR
-- 📋 **Posts a summary comment** with a severity breakdown
-- ✅ **Sets a commit status** — `✅ clean` / `⚠️ warnings` / `❌ issues found`
-
----
-
-## Architecture
-
-```
-GitHub PR Event  (HMAC-SHA256 signed webhook)
-        │
-        ▼
-FastAPI Gateway ──── HMAC auth ──── Rate limiter (Redis)
-        │
-        ▼
-Celery Worker  (async job queue)
-        │
-        ▼
-LangGraph Agent
-  ├── Diff Parser       → splits raw diff into reviewable hunks
-  ├── Context Fetcher   → repo tree, README, language detection
-  ├── Prompt Builder    → assembles structured prompt per hunk
-  ├── LLM Backend       → OpenRouter | Ollama | Groq | OpenAI | Anthropic
-  └── Response Parser   → validates FILE | LINE | SEVERITY | MESSAGE format
-        │
-        ▼
-GitHub API Client
-  ├── Inline review comments  (line-level)
-  ├── PR summary comment
-  └── Commit status update
-        │
-        ▼
-Observability Stack
-  ├── Prometheus metrics  (latency, tokens, comment counts, errors)
-  ├── Structured JSON logs → Loki
-  └── Grafana dashboard   (infra/grafana/dashboard.json)
+```mermaid
+flowchart LR
+    GH[GitHub PR event] --> API[FastAPI: HMAC verification]
+    API --> Redis[Redis: atomic deduplication]
+    Redis --> Worker[Celery review worker]
+    Worker --> Graph[LangGraph review pipeline]
+    Graph --> LLM[Local or hosted model]
+    LLM --> Parse[Validate paths, lines, severity]
+    Parse --> Review[GitHub review and commit status]
 ```
 
----
+The worker fetches the diff, checks the PR revision before and after fetching and before publication, and runs six pipeline nodes: diff parsing, context retrieval, prompt validation, model review, response filtering, and summary generation.
 
-## Quick Start
+| Engineering choice | What it demonstrates |
+| --- | --- |
+| HMAC signatures and bounded request bodies | Authenticate webhook deliveries and limit memory use |
+| Atomic Redis claim scoped to repository, PR, and SHA | Suppress duplicate work during the one-hour claim window |
+| Celery retries and revision checks | Keep slow inference outside the request and avoid known stale reviews |
+| Validated model output | Only post findings on the reviewed file and valid right-side diff lines |
+| Review payload reconciliation | Reuse an identical submitted review after a lost response |
+| Locked dependencies and package checks | Make setup repeatable and verify runtime prompt assets |
 
-**Prerequisites:** Docker, Docker Compose, a GitHub App (takes ~3 mins to create)
+Reviews run for `opened`, `synchronize`, and `reopened` events. Oversized diffs, invalid model responses, and provider failures produce an error rather than a clean result. Changes with no reviewable hunks are marked skipped with an error status.
+
+## Run the offline demo
+
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/getting-started/installation/). From the repository root:
 
 ```bash
-# 1. Clone and configure
-git clone https://github.com/Protagonist01/code-review-agent
+git clone https://github.com/Protagonist01/code-review-agent.git
 cd code-review-agent
-cp .env.example .env
+uv sync --locked --extra dev
+uv run --locked code-review-demo
 ```
 
-Open `.env` and fill in your GitHub App credentials, then pick an LLM backend:
+The demo runs the parser, packaged prompt, response validation, and summary generation using a **recorded model response**. It makes no GitHub or provider calls. It demonstrates pipeline behavior, not model accuracy.
+
+Example finding:
+
+```text
+calculator.py:3 | ERROR | Guard against an empty list before dividing.
+```
+
+A standard pip install is also supported: `python -m pip install -e ".[dev]"`, then `python -m src.demo`. This resolves dependencies afresh; use the lockfile workflow for the tested dependency set.
+
+## Run real GitHub reviews
+
+Requires Docker Compose, a GitHub App installed on a test repository, and a configured model provider.
+
+1. Copy `.env.example` to `.env` (`cp .env.example .env`, or `Copy-Item .env.example .env` in PowerShell).
+2. Set `GITHUB_APP_ID`, `GITHUB_WEBHOOK_SECRET`, and the provider API key. Save the App private key at `keys/private-key.pem`. Never commit credentials.
+3. Grant repository permissions: Contents (read), Pull requests (read/write), and Commit statuses (read/write). Subscribe to Pull request events.
+4. Set `LLM_PROVIDER` and its model. Example model IDs must be checked against the provider's available models.
+5. Start the core services:
 
 ```bash
-# Option A — OpenRouter free tier (recommended for demos, no GPU needed)
-LLM_PROVIDER=openrouter
-OPENROUTER_API_KEY=your_key_here        # free at openrouter.ai/keys
-OPENROUTER_MODEL=cohere/north-mini-code:free
-
-# Option B — Local Ollama (zero code egress, runs on your machine)
-LLM_PROVIDER=ollama
-# then pull a model:
-docker run --rm ollama/ollama pull codellama:7b
-
-# Option C — Paid frontier API
-LLM_PROVIDER=openai   # or: groq | anthropic
-OPENAI_API_KEY=your_key_here
+docker compose --env-file .env -f infra/docker-compose.yml up --build -d redis api worker
 ```
+
+Configure the App webhook URL as `https://YOUR_HOST/webhook` with the same secret. For local testing, use an HTTPS tunnel to `http://localhost:8000`. Tunnel software is installed separately. Public hosting needs an HTTPS proxy that exposes only `/webhook` and limits request size and rate; see [deployment guidance](docs/deployment.md).
+
+| Provider | `LLM_PROVIDER` | Configuration |
+| --- | --- | --- |
+| OpenRouter | `openrouter` | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` |
+| Ollama | `ollama` | `OLLAMA_BASE_URL`, `OLLAMA_MODEL` |
+| Groq | `groq` | `GROQ_API_KEY`, `GROQ_MODEL` |
+| OpenAI | `openai` | `OPENAI_API_KEY`, `OPENAI_MODEL` |
+| Anthropic | `anthropic` | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` |
+
+Hosted providers receive diff and repository context. A local Ollama endpoint keeps inference on your infrastructure; the application still communicates with GitHub. On Docker Desktop, use `OLLAMA_BASE_URL=http://host.docker.internal:11434` and pull the configured model on the host. Other Docker hosts need a reachable Ollama address.
+
+## Verification and development
 
 ```bash
-# 2. Start the full stack
-docker compose -f infra/docker-compose.yml up --build
-
-# 3. Expose locally for webhook delivery
-.\tools\cloudflared.exe tunnel --url http://localhost:8000
-
-# 4. Register the webhook in your GitHub App settings:
-#    Payload URL → https://<your-trycloudflare-url>/webhook
-#    Content type → application/json
-#    Events → Pull requests
+uv run --locked pytest
+uv run --locked ruff check src tests evals scripts
+uv run --locked ruff format --check src tests evals scripts
+uv run --locked mypy src
+uv build --no-sources
+uv run --locked python scripts/check_artifacts.py
 ```
 
-> Your first PR will trigger a review in **~2–5s** on OpenRouter/Groq, or **~15–30s** with local Ollama on CPU.
+The suite enforces at least 80% source line coverage. CI is configured for Python 3.11 and 3.13, dependency auditing, wheel installation outside the checkout, and container readiness. These are workflow definitions; see the assessment for checks actually executed.
 
-For daily start/stop, log tailing, and tunnel commands, see [`docs/run-cheatsheet.md`](docs/run-cheatsheet.md).
+The wheel includes the versioned prompt and offline demo. The source archive includes tests and operational configuration. Credentials, local tools, caches, editorial images, and generated results are excluded.
 
----
-
-## LLM Backend Options
-
-| Provider | `LLM_PROVIDER` | Key Required | Notes |
-|---|---|---|---|
-| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | Free `:free` models available — best for demos |
-| Ollama | `ollama` | None | Fully local; quality depends on model size |
-| Groq | `groq` | `GROQ_API_KEY` | Very fast inference; generous free tier |
-| OpenAI | `openai` | `OPENAI_API_KEY` | High quality; default `gpt-4o-mini` |
-| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | Best for complex reasoning; default `claude-haiku-4-5` |
-
-Switching backends requires **only a config change** — no code changes. The LLM is abstracted behind a common interface in the LangGraph agent.
-
----
-
-## How It Works
-
-### 1. Webhook Authentication
-Every incoming request is verified against GitHub's HMAC-SHA256 signature before any processing begins. Invalid signatures return `403` immediately with no detail leaked.
-
-### 2. Diff Parsing
-Raw unified diffs are parsed into **hunks** — isolated change blocks with surrounding context lines. Each hunk is reviewed independently to keep prompts focused and within the LLM's context window.
-
-### 3. LangGraph State Machine
-The review pipeline is a LangGraph graph with explicit state transitions. This makes the pipeline:
-- **Inspectable** — each node has a defined input/output schema
-- **Testable** — nodes can be unit-tested in isolation
-- **Extensible** — new steps (e.g., cross-file reasoning) slot in without rewriting control flow
-
-See [`docs/adr/002-langgraph-vs-custom-loop.md`](docs/adr/002-langgraph-vs-custom-loop.md) for the design rationale.
-
-### 4. Prompt Design
-Prompts are stored as versioned `.txt` files in `src/agent/prompts/`, not hardcoded in Python. This makes prompt iteration trackable in git — `git log` shows the full prompt evolution.
-
-### 5. Structured Output Parsing
-The LLM responds in a strict `FILE | LINE | SEVERITY | MESSAGE` format. The response parser validates this structure and **silently discards malformed outputs** rather than posting garbled comments.
-
----
-
-## Testing
+## Model evaluation
 
 ```bash
-make test              # run all tests
-make test-unit         # fast unit tests only (no Docker)
-make test-integration  # full webhook-to-GitHub-API flow (Docker required; LLM calls mocked)
-make coverage          # generates htmlcov/index.html
+uv run --locked python -m evals.run_evals --backend ollama
 ```
 
-| Suite | What it covers |
-|---|---|
-| `tests/unit/` | Diff parser, response parser, HMAC auth — pure functions, no I/O |
-| `tests/integration/` | Full webhook → Celery → agent → GitHub API flow with mocked responses |
-| `tests/fixtures/` | Real `.patch` files from open-source repos for deterministic replay |
+The ten example cases exercise real inference without GitHub access. The runner records provider/model, matches findings by file, line, severity, and message pattern, and reports precision, recall, run completion, and p95 latency. A failed threshold returns a failing exit code. Hosted calls can incur costs. These patterns and a small dataset do not establish real-world model accuracy.
 
-**Coverage gate:** CI fails below 80% line coverage.
+## Operations and limits
 
----
+- `/health` checks that the API is running. `/ready` checks API-to-Redis connectivity; it does not check workers, GitHub, or the model.
+- Ports bind to localhost. Containers run as a non-root user; keys are mounted read-only and Redis data persists in a volume.
+- Monitoring is optional. Set a strong `GRAFANA_ADMIN_PASSWORD` in `.env`, then run `docker compose --env-file .env -f infra/docker-compose.yml --profile monitoring up -d`.
+- `/metrics` exposes API-process metrics. Worker counters are not aggregated, token usage is not recorded, and alert delivery is not configured. Dashboard panels for those signals need separate instrumentation.
+- Concurrent jobs or changed model output on retries can duplicate reviews. Revision checks reduce stale publication but do not make the final GitHub write atomic.
+- Reviews are per-hunk. Deleted files, generated files, binaries, and other unsupported changes can be omitted. Cross-file reasoning and prompt-injection resistance are not established.
 
-## Evaluation
-
-Beyond unit tests, review quality is measured against a curated golden set:
-
-```bash
-make eval
-```
-
-`evals/golden_set.jsonl` contains **50 real diffs** with known issues (seeded bugs, security vulnerabilities, style violations).
-
-| Metric | Target |
-|---|---|
-| True positive rate (known issues caught) | ≥ 70% |
-| False positive rate (correct code flagged) | ≤ 15% |
-| Comment parse success rate | ≥ 98% |
-| Mean review latency (p95) | < 30s |
-
-Results are written to `evals/results/latest.json` and tracked over time to catch prompt regressions.
-
----
-
-## Monitoring
-
-The full Grafana dashboard is committed at `infra/grafana/dashboard.json` — import it directly after `make up`.
-
-**Prometheus metrics exposed at `/metrics`:**
-
-| Metric | Description |
-|---|---|
-| `review_duration_seconds` | End-to-end PR review latency histogram |
-| `llm_tokens_used_total` | Token consumption by model |
-| `comments_posted_total` | Comments posted, labelled by severity |
-| `webhook_errors_total` | Auth failures, parse errors, GitHub API errors |
-| `active_reviews` | In-flight review jobs (gauge) |
-
-**Alerts** (defined in `infra/prometheus/alert_rules.yml`):
-- Review latency p95 > 60s → Slack / PagerDuty
-- Error rate > 5% over 5 minutes → Slack
-
----
-
-## Project Structure
-
-```
-code-review-agent/
-├── src/
-│   ├── agent/              # LangGraph agent + nodes
-│   │   └── prompts/        # versioned .txt prompt files
-│   ├── api/                # FastAPI gateway + webhook endpoint
-│   ├── github_client/      # thin GitHub API wrapper
-│   ├── config.py           # pydantic-settings config
-│   └── worker.py           # Celery worker definition
-├── tests/
-│   ├── unit/               # pure function tests
-│   ├── integration/        # end-to-end flow tests
-│   └── fixtures/           # real .patch files for replay
-├── evals/
-│   ├── golden_set.jsonl    # 50 labelled diffs
-│   └── run_evals.py        # eval runner + metrics
-├── infra/
-│   ├── docker-compose.yml
-│   ├── prometheus/         # scrape config + alert rules
-│   └── grafana/
-│       └── dashboard.json  # importable Grafana dashboard
-├── docs/
-│   ├── adr/                # Architecture Decision Records
-│   └── run-cheatsheet.md   # daily dev commands
-├── tools/                  # local dev utilities (cloudflared)
-├── .env.example
-├── Makefile
-└── pyproject.toml
-```
-
----
-
-## Limitations & Roadmap
-
-**Current limitations:**
-- Reviews are per-hunk — cross-file issues (e.g., a function renamed in one file but not updated in another) are not detected
-- No memory between PRs — the agent doesn't learn a repo's coding patterns over time
-- Local Ollama inference speed is hardware-dependent; free OpenRouter models are recommended on low-spec machines
-
-**Planned:**
-- [ ] Cross-hunk reasoning pass after per-hunk review
-- [ ] Repo-level memory via vector store (track recurring patterns per repo)
-- [ ] Per-repo review rules defined in `.review-agent.yml`
-- [ ] Streaming comment posting (post as comments are generated, not batch at end)
-
----
+See the [run cheat sheet](docs/run-cheatsheet.md), [contributing guide](CONTRIBUTING.md), [security policy](SECURITY.md), and [build book](BUILD_BOOK.md).
 
 ## License
 
-[MIT](LICENSE) — use it, fork it, ship it.
+[MIT](LICENSE).

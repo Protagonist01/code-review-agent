@@ -1,169 +1,79 @@
-﻿# Architecture â€” AI Code Review Agent
+# Architecture
 
-## Overview
+The API accepts signed GitHub events and queues work. The worker owns GitHub reads and writes. The LangGraph pipeline converts a diff and repository context into validated review findings.
 
-The **AI Code Review Agent** is an event-driven service that automatically
-reviews GitHub pull requests using a multi-node LangGraph state machine backed
-by a pluggable LLM provider (OpenRouter, Ollama, Groq, OpenAI, or Anthropic).
-
-When a `pull_request` webhook fires, the FastAPI gateway enqueues a Celery
-task. The Celery worker invokes the LangGraph graph, which orchestrates
-diff fetching â†’ context retrieval â†’ LLM analysis â†’ comment posting in a
-structured, retry-aware pipeline.
-
----
-
-## LangGraph State Machine
+## Runtime boundaries
 
 ```mermaid
-flowchart TD
-    START([__start__]) --> fetch_diff
-
-    fetch_diff --> parse_diff
-    parse_diff --> fetch_context
-
-    fetch_context --> analyze
-
-    analyze --> should_retry{error?}
-    should_retry -- yes, retry_count < MAX --> analyze
-    should_retry -- max retries exceeded --> post_error_comment
-
-    should_retry -- no error --> filter_comments
-    filter_comments --> post_review
-
-    post_review --> END([__end__])
-    post_error_comment --> END
+sequenceDiagram
+    participant GH as GitHub
+    participant API as FastAPI
+    participant Redis
+    participant Worker as Celery
+    participant Model as Model provider
+    GH->>API: Signed pull_request delivery
+    API->>API: Bound body size, verify HMAC, validate metadata
+    API->>Redis: SET repository/PR/SHA claim NX EX 3600
+    API->>Redis: Enqueue Celery review task
+    API-->>GH: 202 Accepted
+    Redis->>Worker: Review task
+    Worker->>GH: Pending status, PR metadata, diff, metadata
+    Worker->>GH: Language, tree, README context
+    Worker->>Model: Per-hunk review (up to five concurrent calls)
+    Model-->>Worker: Structured finding lines or NONE
+    Worker->>Worker: Validate paths, lines, severities and build summary
+    Worker->>GH: Check head SHA, reconcile review payload, publish review
+    Worker->>GH: Final commit status
 ```
 
-### Node Descriptions
+The claim is scoped to repository, pull request, and commit SHA. Dispatch failure attempts to release it and returns 503. A broker acknowledgement can be lost after enqueueing, so this is duplicate suppression, not exactly-once execution.
+
+## Pipeline
+
+```mermaid
+flowchart LR
+    Start --> diff_parser --> context_fetcher --> prompt_builder --> llm_reviewer --> response_parser --> summary_builder --> End
+```
 
 | Node | Responsibility |
-|------|---------------|
-| `fetch_diff` | Downloads the raw unified diff for the PR via the GitHub API (App auth or PAT). Stores it in `state.raw_diff`. |
-| `parse_diff` | Splits `raw_diff` into `DiffHunk` objects â€” one per file-chunk â€” and populates `state.hunks`. |
-| `fetch_context` | Retrieves repository context: primary language, abbreviated README, and top-level file tree. Stored in `state.repo_context`. |
-| `analyze` | Sends each hunk to the configured LLM with a structured prompt. Parses the response into `ReviewComment` objects and accumulates them in `state.review_comments`. Also sets `state.summary` and `state.severity`. |
-| `filter_comments` | Removes comments below `settings.min_comment_severity` and deduplicates near-identical messages. |
-| `post_review` | Calls the GitHub Reviews API to submit all comments as a single review in `COMMENT` mode. |
-| `post_error_comment` | Posts a polite error message on the PR when all retries are exhausted. |
+| --- | --- |
+| `diff_parser` | Parse supported text hunks, infer language, skip generated/noise files, reject oversized diffs |
+| `context_fetcher` | Fetch repository language, top-level tree and a 500-character README excerpt; fall back to empty context on errors |
+| `prompt_builder` | Load and cache the versioned prompt; assemble each hunk's prompt |
+| `llm_reviewer` | Use the configured backend with a five-call semaphore and a 30-second timeout per hunk |
+| `response_parser` | Filter findings by minimum severity after validating file and right-side line positions |
+| `summary_builder` | Render a summary and choose the highest remaining severity |
 
----
+`ReviewState` is a typed dictionary. Hunk, context, and finding models use Pydantic. The graph has no conditional retries or checkpoint storage. Celery retries the whole task up to three times with backoff.
 
-## Data Flow
+`build_graph(fetch_context=False, backend=...)` supports isolated demos and evaluations. Production defaults still fetch context and use the configured real backend. The demo injects a recorded response. Evaluations skip GitHub context and use actual model inference.
 
-```
-GitHub Webhook
-      â”‚
-      â–¼
-â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”    HMAC-SHA256    â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
-â”‚  FastAPI    â”‚â—„â”€â”€â”€â”€ verified â”€â”€â”€â”€â”‚  GitHub Platform â”‚
-â”‚  /webhook   â”‚                   â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
-â””â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”˜
-       â”‚ enqueue task
-       â–¼
-â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”     Redis      â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
-â”‚   Celery    â”‚â—„â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–ºâ”‚    Redis Broker  â”‚
-â”‚   Worker    â”‚                â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
-â””â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”˜
-       â”‚ ainvoke
-       â–¼
-â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
-â”‚       LangGraph Graph       â”‚
-â”‚  fetch_diff â†’ parse_diff    â”‚
-â”‚  â†’ fetch_context â†’ analyze  â”‚
-â”‚  â†’ filter â†’ post_review     â”‚
-â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
-               â”‚ GitHub Reviews API
-               â–¼
-        Pull Request Review
-```
+## Authentication and publication
 
----
+Webhook authentication uses HMAC-SHA256 and constant-time comparison. GitHub API authentication uses short-lived App JWTs exchanged for installation tokens; a PAT alternative exists for local development. Restrict the App to test repositories while validating behavior.
 
-## LLM Backend Abstraction
+The worker checks the head SHA before fetching the diff, after fetching, and before publishing. A newer revision produces an error status on the obsolete commit and no review. There is still a race between the final check and the remote write.
 
-The `analyze` node delegates to a provider factory in `src/agent/llm_backend.py`
-that returns an `LLMBackend` implementation based on `settings.llm_provider`:
+Review publication hashes the intended payload and adds a hidden marker. Before posting, the client searches paginated reviews for the same marker and commit. An identical submitted payload is reused. Concurrent workers and different model output on retry can still duplicate reviews.
 
-| Provider | Model | Config keys |
-|----------|-------|-------------|
-| `openrouter` | `cohere/north-mini-code:free` | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `OPENROUTER_BASE_URL` |
-| `groq` | `llama-3.3-70b-versatile` | `GROQ_API_KEY`, `GROQ_MODEL` |
-| `ollama` | `codellama:7b` | `OLLAMA_BASE_URL`, `OLLAMA_MODEL` |
-| `openai` | `gpt-4o-mini` | `OPENAI_API_KEY`, `OPENAI_MODEL` |
-| `anthropic` | `claude-haiku-4-5` | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` |
+## Failure behavior
 
-Provider-specific imports live behind the backend factory, so swapping
-backends requires changing a single env variable - no code changes.
+Invalid signatures return 403; malformed relevant payloads return 400; oversized requests return 413; Redis or dispatch failures return 503. Unsupported events and duplicate claims return 200. Accepted jobs return 202.
 
-where `ReviewOutput` is a Pydantic v2 model. This guarantees the LLM response
-is always parseable into typed `ReviewComment` objects.
-
----
-
-## Async Processing (Celery + Redis)
-
-```
-FastAPI (sync route)
-  â””â”€â”€ enqueue_review_task.delay(owner, repo, pr_number, â€¦)
-                â”‚
-                â–¼
-        Redis list (queue: "reviews")
-                â”‚
-                â–¼
-        Celery worker process
-          â””â”€â”€ asyncio.run(review_graph.ainvoke(state))
-```
-
-- The FastAPI webhook handler returns **202 Accepted** immediately after
-  enqueueing, so GitHub receives a fast acknowledgement within its 10-second
-  window.
-- The Celery worker runs the fully-async LangGraph graph inside
-  `asyncio.run()` on a dedicated OS thread-pool worker.
-- Task result and error state are persisted in Redis so Flower can
-  display them, and retries are handled at the **LangGraph node level** (not
-  the Celery level) for fine-grained control.
-
----
+Model errors and invalid results fail the task. Empty supported-hunk coverage is marked skipped, not clean. Fetch or publication failures attempt an error commit status before being re-raised for Celery retry. Error-status failure is logged without masking the original failure.
 
 ## Observability
 
-### Metrics (Prometheus)
+The API configures structured access logs with request IDs. `/health` is a liveness check. `/ready` pings Redis; it does not prove the worker, GitHub, or provider is ready.
 
-The FastAPI app exposes `/metrics` (via `prometheus_fastapi_instrumentator`
-plus custom `prometheus_client` counters/histograms):
+`/metrics` exports the API process registry. `webhook_requests_total` and `webhook_errors_total` support API error-rate monitoring. Worker code updates `active_reviews`, `review_duration_seconds`, `comments_posted_total`, and `reviews_completed_total` in separate processes; the API scrape does not collect those updates. `llm_tokens_used_total` is declared but not instrumented.
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `review_duration_seconds` | Histogram | End-to-end latency per review |
-| `review_comments_total` | Counter | Comments posted, labelled by `severity` |
-| `active_reviews` | Gauge | In-flight review tasks |
-| `webhook_errors_total` | Counter | Webhook processing errors by `error_type` |
-| `llm_tokens_total` | Counter | LLM tokens consumed |
-| `reviews_completed_total` | Counter | Successfully completed reviews |
+Prometheus rules and a Grafana dashboard are supplied as an optional monitoring profile. Worker panels are scaffolding until worker metrics collection is implemented. Alertmanager and Loki are not configured.
 
-### Alerting (Prometheus Alertmanager)
+## Design records
 
-Three alert rules are defined in `infra/prometheus/alert_rules.yml`:
-
-- **ReviewLatencyHigh** â€” p95 > 60 s for 5 min â†’ `warning`
-- **WebhookErrorRateHigh** â€” error rate > 5% â†’ `critical`
-- **ActiveReviewsStuck** â€” > 10 in-flight for 10 min â†’ `warning`
-
-### Dashboards (Grafana)
-
-The pre-built Grafana dashboard (`infra/grafana/dashboard.json`) provides
-six panels covering latency percentiles, comment severity breakdown, active
-reviews gauge, webhook error trends, LLM token consumption, and review
-throughput. It auto-provisions from the `infra/grafana/provisioning/`
-directory and connects to Prometheus via the `DS_PROMETHEUS` datasource variable.
-
-### Structured Logging
-
-All components use `structlog` with JSON output (when `LOG_JSON=true`) for
-machine-parseable logs. Key log events include:
-
-- `webhook.received` â€” raw GitHub event metadata
-- `review.started / review.completed / review.failed` â€” task lifecycle
-- `llm.invoke` â€” provider, model, token counts, latency
-- `github.post_review` â€” comment count and PR reference
+- [Original local-inference decision](adr/001-local-llm-via-ollama.md), superseded by the provider strategy.
+- [Current provider strategy](adr/004-llm-backend-strategy.md).
+- [Why LangGraph](adr/002-langgraph-vs-custom-loop.md).
+- [Why Celery and Redis](adr/003-async-celery-redis.md).
+- [Build book](../BUILD_BOOK.md) for implementation and failure diagnosis.

@@ -9,12 +9,11 @@ responses into :class:`~src.agent.models.ReviewComment` objects using
 from __future__ import annotations
 
 import asyncio
-from typing import Any
 
 import structlog
 
-from src.agent.llm_backend import get_llm_backend
-from src.agent.models import DiffHunk, ReviewComment
+from src.agent.llm_backend import LLMBackend, get_llm_backend
+from src.agent.models import DiffHunk, RepoContext, ReviewComment
 from src.agent.nodes.prompt_builder import build_hunk_prompt
 from src.agent.nodes.response_parser import parse_llm_response
 from src.agent.state import ReviewState
@@ -30,16 +29,15 @@ _HUNK_TIMEOUT_SECONDS = 30.0
 
 async def _review_hunk(
     hunk: DiffHunk,
-    backend: Any,
+    backend: LLMBackend,
     semaphore: asyncio.Semaphore,
-    context: Any,
+    context: RepoContext,
 ) -> list[ReviewComment]:
     """Review a single hunk via the LLM backend.
 
     Acquires ``semaphore`` before making the LLM call so we never exceed
     ``_MAX_CONCURRENCY`` parallel requests.  Times out after
-    ``_HUNK_TIMEOUT_SECONDS`` and returns an empty list on timeout or any
-    unexpected exception.
+    ``_HUNK_TIMEOUT_SECONDS`` and raises on timeout or provider failure so an incomplete review cannot pass.
 
     Args:
         hunk: The :class:`~src.agent.models.DiffHunk` to review.
@@ -64,7 +62,7 @@ async def _review_hunk(
                 hunk_header=hunk.hunk_header,
                 timeout_seconds=_HUNK_TIMEOUT_SECONDS,
             )
-            return []
+            raise
         except Exception as exc:  # noqa: BLE001
             log.error(
                 "llm_reviewer.hunk_error",
@@ -73,17 +71,24 @@ async def _review_hunk(
                 error=str(exc),
                 exc_info=True,
             )
-            return []
+            raise
 
         log.debug(
             "llm_reviewer.hunk_complete",
             file_path=hunk.file_path,
             response_chars=len(raw_response),
         )
-        return parse_llm_response(raw_response, hunk)
+        comments = parse_llm_response(raw_response, hunk)
+        if not comments and raw_response.strip().upper() != "NONE":
+            raise ValueError("LLM returned no valid review result")
+        return comments
 
 
-async def llm_reviewer(state: ReviewState) -> dict[str, list[ReviewComment]]:
+async def llm_reviewer(
+    state: ReviewState,
+    *,
+    backend: LLMBackend | None = None,
+) -> dict[str, list[ReviewComment]]:
     """LangGraph node: review all diff hunks concurrently via the LLM backend.
 
     For each :class:`~src.agent.models.DiffHunk` in ``state["hunks"]``:
@@ -115,24 +120,17 @@ async def llm_reviewer(state: ReviewState) -> dict[str, list[ReviewComment]]:
         log.info("llm_reviewer.no_hunks")
         return {"review_comments": []}
 
-    from src.agent.models import RepoContext  # noqa: PLC0415
-
     context = state.get("repo_context", RepoContext())
 
-    backend = get_llm_backend()
+    backend = backend if backend is not None else get_llm_backend()
     semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
 
-    tasks = [
-        _review_hunk(hunk, backend, semaphore, context)
-        for hunk in hunks
-    ]
+    tasks = [_review_hunk(hunk, backend, semaphore, context) for hunk in hunks]
 
     results: list[list[ReviewComment]] = await asyncio.gather(*tasks)
 
     all_comments: list[ReviewComment] = [
-        comment
-        for hunk_comments in results
-        for comment in hunk_comments
+        comment for hunk_comments in results for comment in hunk_comments
     ]
 
     log.info(

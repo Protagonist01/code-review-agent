@@ -13,7 +13,7 @@ def sample_hunk() -> DiffHunk:
         file_path="src/calculator.py",
         start_line=10,
         hunk_header="@@ -10,7 +10,10 @@",
-        content="-    return a / b\n+    return None",
+        content=" context\n context\n-    return a / b\n+    return None\n+    other()",
         language="Python",
     )
 
@@ -56,10 +56,7 @@ def test_multiple_comments(sample_hunk: DiffHunk) -> None:
 
 def test_malformed_line_skipped(sample_hunk: DiffHunk) -> None:
     """Lines that cannot be parsed should be silently skipped."""
-    raw = (
-        "This is not valid format\n"
-        "src/calculator.py | 12 | warning | Valid comment"
-    )
+    raw = "This is not valid format\nsrc/calculator.py | 12 | warning | Valid comment"
     result = parse_llm_response(raw, sample_hunk)
     assert len(result) == 1
 
@@ -118,3 +115,14 @@ def test_result_type_is_review_comment(sample_hunk: DiffHunk) -> None:
     result = parse_llm_response(raw, sample_hunk)
     for item in result:
         assert isinstance(item, ReviewComment)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "other.py | 12 | error | Wrong file",
+        "src/calculator.py | 999 | error | Outside diff",
+    ],
+)
+def test_rejects_locations_outside_hunk(sample_hunk, raw):
+    assert parse_llm_response(raw, sample_hunk) == []

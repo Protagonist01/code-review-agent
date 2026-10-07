@@ -46,12 +46,11 @@ async def context_fetcher(state: ReviewState) -> dict[str, RepoContext]:
         return {"repo_context": RepoContext()}
 
     try:
-        client = GitHubClient(installation_id=installation_id)
+        async with GitHubClient(installation_id=installation_id) as client:
+            language: str | None = await client.get_repo_language(owner, repo)
+            file_tree: list[str] = await client.get_file_tree(owner, repo, pr_sha)
 
-        language: str | None = await client.get_repo_language(owner, repo)
-        file_tree: list[str] = await client.get_file_tree(owner, repo, pr_sha)
-
-        raw_readme: str | None = await client.get_readme(owner, repo, pr_sha)
+            raw_readme: str | None = await client.get_readme(owner, repo, pr_sha)
         readme_excerpt: str | None = raw_readme[:500] if raw_readme else None
 
         log.info(

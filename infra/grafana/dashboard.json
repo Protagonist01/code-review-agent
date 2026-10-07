@@ -110,7 +110,8 @@
           "legendFormat": "p99",
           "refId": "C"
         }
-      ]
+      ],
+      "description": "Worker metrics are not collected by the API scrape. Configure a worker exporter or multiprocess collection before interpreting this panel; zero here does not prove zero worker activity."
     },
     {
       "id": 2,
@@ -145,11 +146,12 @@
       },
       "targets": [
         {
-          "expr": "sum by (severity) (increase(review_comments_total[1h]))",
+          "expr": "sum by (severity) (increase(comments_posted_total[1h]))",
           "legendFormat": "{{severity}}",
           "refId": "A"
         }
-      ]
+      ],
+      "description": "Worker metrics are not collected by the API scrape. Configure a worker exporter or multiprocess collection before interpreting this panel; zero here does not prove zero worker activity."
     },
     {
       "id": 3,
@@ -207,7 +209,8 @@
           "legendFormat": "Active Reviews",
           "refId": "A"
         }
-      ]
+      ],
+      "description": "Worker metrics are not collected by the API scrape. Configure a worker exporter or multiprocess collection before interpreting this panel; zero here does not prove zero worker activity."
     },
     {
       "id": 4,
@@ -298,11 +301,12 @@
       },
       "targets": [
         {
-          "expr": "increase(llm_tokens_total[24h])",
+          "expr": "increase(llm_tokens_used_total[24h])",
           "legendFormat": "Tokens (24h)",
           "refId": "A"
         }
-      ]
+      ],
+      "description": "Token accounting is not instrumented. This panel is a placeholder until token usage is recorded and worker metrics are collected."
     },
     {
       "id": 6,
@@ -347,7 +351,8 @@
           "legendFormat": "Reviews/min",
           "refId": "A"
         }
-      ]
+      ],
+      "description": "Worker metrics are not collected by the API scrape. Configure a worker exporter or multiprocess collection before interpreting this panel; zero here does not prove zero worker activity."
     }
   ],
   "refresh": "30s",

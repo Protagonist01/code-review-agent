@@ -90,6 +90,7 @@ def sample_comment() -> ReviewComment:
 
 # ── HMAC helper ────────────────────────────────────────────────────────────────
 
+
 def make_signature(payload: bytes, secret: str = "test-secret") -> str:
     """Compute the sha256 HMAC signature string for *payload*."""
     sig = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
@@ -106,6 +107,7 @@ def webhook_secret(monkeypatch) -> str:
 
 # ── Mock LLM backend ───────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def mock_llm_backend():
     """Return an AsyncMock LLM backend that returns a pre-canned pipe-delimited response."""
@@ -120,6 +122,7 @@ def mock_llm_backend():
 
 
 # ── Webhook payload factories ──────────────────────────────────────────────────
+
 
 def make_pr_payload(
     owner: str = "testorg",

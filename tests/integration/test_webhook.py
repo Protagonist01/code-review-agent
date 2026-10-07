@@ -28,12 +28,14 @@ def pr_payload(
     repo: str = "repo",
 ) -> bytes:
     """Build a minimal GitHub pull_request event payload."""
-    return json.dumps({
-        "action": action,
-        "pull_request": {"number": pr_number, "head": {"sha": sha}},
-        "repository": {"name": repo, "owner": {"login": owner}},
-        "installation": {"id": 999},
-    }).encode()
+    return json.dumps(
+        {
+            "action": action,
+            "pull_request": {"number": pr_number, "head": {"sha": sha}},
+            "repository": {"name": repo, "owner": {"login": owner}},
+            "installation": {"id": 999},
+        }
+    ).encode()
 
 
 @pytest.fixture
@@ -43,7 +45,15 @@ def client(monkeypatch):
 
     mock_redis = AsyncMock()
     mock_redis.exists = AsyncMock(return_value=False)
-    mock_redis.setex = AsyncMock()
+    claimed = set()
+
+    async def claim(key, value, **kwargs):
+        if key in claimed:
+            return False
+        claimed.add(key)
+        return True
+
+    mock_redis.set = AsyncMock(side_effect=claim)
     mock_task = MagicMock()
     mock_task.delay = MagicMock()
 
@@ -187,5 +197,90 @@ def test_duplicate_delivery_idempotent(client) -> None:
     resp1 = client.post("/webhook", content=payload, headers=headers)
     # Second delivery with the same ID should be idempotent
     resp2 = client.post("/webhook", content=payload, headers=headers)
-    assert resp1.status_code in (200, 202)
-    assert resp2.status_code in (200, 202)
+    assert resp1.status_code == 202
+    assert resp2.status_code == 200
+
+
+@pytest.mark.parametrize("payload", [b"{", b"[]", b'{"action":"opened"}'])
+def test_invalid_payload_returns_400(client, payload):
+    response = client.post(
+        "/webhook",
+        content=payload,
+        headers={
+            "X-GitHub-Event": "pull_request",
+            "X-Hub-Signature-256": make_sig(payload),
+        },
+    )
+    assert response.status_code == 400
+
+
+def test_enqueue_failure_releases_claim(client):
+    payload = pr_payload()
+    with (
+        patch("src.api.webhook.review_pr.delay", side_effect=RuntimeError("broker down")),
+        patch("src.api.app._redis.delete", new_callable=AsyncMock) as delete,
+    ):
+        response = client.post(
+            "/webhook",
+            content=payload,
+            headers={
+                "X-GitHub-Event": "pull_request",
+                "X-Hub-Signature-256": make_sig(payload),
+            },
+        )
+    assert response.status_code == 503
+    delete.assert_awaited_once_with("review:org:repo:1:abc123")
+
+
+def test_payload_limit_applies_to_streamed_body(client, monkeypatch):
+    monkeypatch.setattr(settings, "max_webhook_bytes", 10)
+    response = client.post("/webhook", content=b"x" * 11)
+    assert response.status_code == 413
+
+
+def test_unicode_signature_is_rejected_without_server_error(client):
+    response = client.post(
+        "/webhook", content=b"{}", headers=[(b"X-Hub-Signature-256", b"sha256=\xff")]
+    )
+    assert response.status_code == 403
+
+
+def test_readiness_reports_redis_failure(client):
+    with patch("src.api.app._redis.ping", side_effect=RuntimeError("down")):
+        assert client.get("/ready").status_code == 503
+    assert client.get("/ready").status_code == 200
+
+
+def test_broker_and_cleanup_failure_still_return_503(client):
+    with (
+        patch("src.api.webhook.review_pr.delay", side_effect=RuntimeError("broker down")),
+        patch("src.api.app._redis.delete", side_effect=RuntimeError("redis down")),
+    ):
+        payload = pr_payload()
+        response = client.post(
+            "/webhook",
+            content=payload,
+            headers={
+                "X-GitHub-Event": "pull_request",
+                "X-Hub-Signature-256": make_sig(payload),
+            },
+        )
+    assert response.status_code == 503
+
+
+def test_redis_failure_returns_503_without_dispatch(client):
+    with (
+        patch("src.api.app._redis.set", side_effect=RuntimeError("redis down")),
+        patch("src.api.webhook.review_pr.delay") as dispatch,
+    ):
+        payload = pr_payload()
+        response = client.post(
+            "/webhook",
+            content=payload,
+            headers={
+                "X-GitHub-Event": "pull_request",
+                "X-Hub-Signature-256": make_sig(payload),
+            },
+        )
+    assert response.status_code == 503
+    dispatch.assert_not_called()

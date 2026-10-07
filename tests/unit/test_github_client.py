@@ -13,7 +13,7 @@ from src.github_client.client import GitHubClient
 
 class FakeResponse:
     def __init__(self, json_data=None, text: str = "", status_code: int = 200) -> None:
-        self._json_data = json_data or {}
+        self._json_data = json_data if json_data is not None else {}
         self.text = text
         self.status_code = status_code
 
@@ -31,6 +31,8 @@ class FakeHTTP:
         self.closed = False
 
     async def get(self, path: str, **kwargs):
+        if path.endswith("/reviews"):
+            return FakeResponse([])
         if path.endswith("/pulls/7") and kwargs.get("headers"):
             return FakeResponse(text="diff --git a/a.py b/a.py")
         if path.endswith("/pulls/7"):
@@ -147,3 +149,22 @@ async def test_get_auth_token_fetches_installation_token(monkeypatch) -> None:
 
     assert await auth_module.get_auth_token(123) == "installation-token"
     fetch.assert_awaited_once_with(123)
+
+
+async def test_retry_reconciles_already_published_review(github_client):
+    client, http = github_client
+    await client.post_review("acme", "service", 7, "abc123", [], "Summary")
+    published = dict(http.posts[0][1], state="COMMENT")
+    http.get = AsyncMock(return_value=FakeResponse([published]))
+    await client.post_review("acme", "service", 7, "abc123", [], "Summary")
+    assert len(http.posts) == 1
+
+
+async def test_review_reconciliation_paginates(github_client):
+    client, http = github_client
+    await client.post_review("acme", "service", 7, "abc123", [], "Summary")
+    published = dict(http.posts[0][1], state="COMMENT")
+    http.get = AsyncMock(side_effect=[FakeResponse([{}] * 100), FakeResponse([published])])
+    await client.post_review("acme", "service", 7, "abc123", [], "Summary")
+    assert len(http.posts) == 1
+    assert http.get.call_args.kwargs["params"]["page"] == 2

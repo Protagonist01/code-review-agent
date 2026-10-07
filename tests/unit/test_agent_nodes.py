@@ -12,6 +12,12 @@ from src.agent.nodes.summary_builder import summary_builder
 
 
 class FakeGitHubClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
     def __init__(self, installation_id: int | None = None) -> None:
         self.installation_id = installation_id
 
@@ -70,7 +76,9 @@ async def test_context_fetcher_falls_back_on_client_error(monkeypatch) -> None:
     assert result["repo_context"] == RepoContext()
 
 
-def test_build_hunk_prompt_includes_context(sample_hunk: DiffHunk, sample_context: RepoContext) -> None:
+def test_build_hunk_prompt_includes_context(
+    sample_hunk: DiffHunk, sample_context: RepoContext
+) -> None:
     system_prompt, user_prompt = build_hunk_prompt(sample_hunk, sample_context)
 
     assert "code review" in system_prompt.lower()
@@ -110,14 +118,13 @@ async def test_llm_reviewer_parses_backend_comments(monkeypatch, sample_hunk: Di
 
 
 @pytest.mark.asyncio
-async def test_llm_reviewer_suppresses_backend_errors(monkeypatch, sample_hunk: DiffHunk) -> None:
+async def test_llm_reviewer_propagates_backend_errors(monkeypatch, sample_hunk: DiffHunk) -> None:
     backend = AsyncMock()
     backend.complete = AsyncMock(side_effect=RuntimeError("provider down"))
     monkeypatch.setattr(llm_reviewer_module, "get_llm_backend", lambda: backend)
 
-    result = await llm_reviewer_module.llm_reviewer({"hunks": [sample_hunk]})
-
-    assert result == {"review_comments": []}
+    with pytest.raises(RuntimeError, match="provider down"):
+        await llm_reviewer_module.llm_reviewer({"hunks": [sample_hunk]})
 
 
 @pytest.mark.asyncio
@@ -140,3 +147,21 @@ async def test_summary_builder_reports_clean_when_no_comments() -> None:
 
     assert result["severity"] == "clean"
     assert "No issues found" in result["summary"]
+
+
+@pytest.mark.parametrize("response", ["", "nonsense", "```"])
+async def test_invalid_model_result_fails_review(monkeypatch, sample_hunk, response):
+    backend = AsyncMock()
+    backend.complete.return_value = response
+    monkeypatch.setattr(llm_reviewer_module, "get_llm_backend", lambda: backend)
+    with pytest.raises(ValueError, match="no valid"):
+        await llm_reviewer_module.llm_reviewer({"hunks": [sample_hunk]})
+
+
+async def test_oversized_diff_cannot_pass(monkeypatch):
+    from src.agent.nodes.diff_parser import diff_parser
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "max_diff_lines", 1)
+    with pytest.raises(ValueError, match="MAX_DIFF_LINES"):
+        await diff_parser({"raw_diff": "line1\nline2"})

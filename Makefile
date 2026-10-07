@@ -1,53 +1,37 @@
-.PHONY: up down restart logs test test-unit test-integration coverage eval lint format install install-dev clean
+.PHONY: up down logs demo test lint format build eval install-dev
 
-# ── Docker ─────────────────────────────────────────────────────────────────────
+COMPOSE = docker compose --env-file .env -f infra/docker-compose.yml
+
 up:
-	docker compose -f infra/docker-compose.yml up -d
+	$(COMPOSE) up --build -d redis api worker
 
 down:
-	docker compose -f infra/docker-compose.yml down
-
-restart:
-	docker compose -f infra/docker-compose.yml restart api worker
+	$(COMPOSE) down
 
 logs:
-	docker compose -f infra/docker-compose.yml logs -f api worker
-
-# ── Python ─────────────────────────────────────────────────────────────────────
-install:
-	pip install -e .
+	$(COMPOSE) logs -f api worker
 
 install-dev:
-	pip install -e ".[dev]"
+	uv sync --locked --extra dev
 
-# ── Tests ──────────────────────────────────────────────────────────────────────
+demo:
+	uv run --locked code-review-demo
+
 test:
-	pytest tests/
+	uv run --locked pytest
 
-test-unit:
-	pytest tests/unit/ -v --no-cov
-
-test-integration:
-	pytest tests/integration/ -v
-
-coverage:
-	pytest tests/ --cov=src --cov-report=html
-	@echo "Open htmlcov/index.html to view coverage report"
-
-# ── Evals ──────────────────────────────────────────────────────────────────────
-eval:
-	python evals/run_evals.py
-
-# ── Code quality ───────────────────────────────────────────────────────────────
 lint:
-	ruff check src/ tests/
-	mypy src/
+	uv run --locked ruff check src tests evals scripts
+	uv run --locked ruff format --check src tests evals scripts
+	uv run --locked mypy src
 
 format:
-	ruff format src/ tests/
-	ruff check --fix src/ tests/
+	uv run --locked ruff check --fix src tests evals scripts
+	uv run --locked ruff format src tests evals scripts
 
-# ── Cleanup ────────────────────────────────────────────────────────────────────
-clean:
-	rm -rf .pytest_cache htmlcov .coverage __pycache__
-	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+build:
+	uv build --no-sources
+	uv run --locked python scripts/check_artifacts.py
+
+eval:
+	uv run --locked python -m evals.run_evals

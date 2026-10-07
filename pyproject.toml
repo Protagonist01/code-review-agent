@@ -6,6 +6,13 @@ build-backend = "hatchling.build"
 name = "code-review-agent"
 version = "0.1.0"
 description = "Autonomous AI code review agent for GitHub PRs"
+authors = [{ name = "Henry Fadeni" }]
+keywords = ["github", "code-review", "langgraph", "fastapi", "celery"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Quality Assurance",
+]
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
@@ -28,8 +35,15 @@ dependencies = [
     "cryptography>=42.0.0",
     "PyJWT>=2.8.0",
     "structlog>=24.2.0",
-    "python-multipart>=0.0.9",
 ]
+
+[project.urls]
+Repository = "https://github.com/Protagonist01/code-review-agent"
+Issues = "https://github.com/Protagonist01/code-review-agent/issues"
+Documentation = "https://github.com/Protagonist01/code-review-agent#readme"
+
+[project.scripts]
+code-review-demo = "src.demo:main"
 
 [project.optional-dependencies]
 dev = [
@@ -39,11 +53,15 @@ dev = [
     "respx>=0.21.1",
     "ruff>=0.4.7",
     "mypy>=1.10.0",
-    "types-redis>=4.6.0",
+    "build>=1.2.0",
+    "pip-audit>=2.9.0",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "infra", "evals/*.py", "evals/golden_set.jsonl", "scripts", "docs/architecture.md", "docs/deployment.md", "docs/run-cheatsheet.md", "docs/readiness-assessment.md", "docs/adr", "BUILD_BOOK.md", ".github", ".editorconfig", ".gitattributes", ".gitignore", ".dockerignore", "README.md", "LICENSE", "CONTRIBUTING.md", "SECURITY.md", "pyproject.toml", "uv.lock", ".env.example", "Makefile"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

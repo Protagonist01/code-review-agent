@@ -21,3 +21,12 @@ __pycache__/
 
 .DS_Store
 Thumbs.db
+
+# Credentials and generated local outputs
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
+coverage.xml
+evals/results/*.json

@@ -1,7 +1,7 @@
 # ADR-001: Use a Local LLM via Ollama Instead of a Third-Party API
 
 ## Status
-Accepted
+Superseded by [the provider strategy](004-llm-backend-strategy.md). The historical rationale below predates hosted-provider support; its latency and privacy statements are not current guarantees.
 
 ## Context
 The core value proposition of this project is privacy-preserving code review. Engineering teams handle proprietary source code, unreleased features, and security-sensitive logic in PRs. Sending diffs to a third-party LLM API (OpenAI, Anthropic, etc.) introduces:

@@ -1,38 +1,29 @@
-# ADR-003: Process Reviews Asynchronously via Celery + Redis
+# ADR-003: Process reviews with Celery and Redis
 
 ## Status
-Accepted
+
+Accepted.
 
 ## Context
-GitHub webhooks expect an HTTP `200` response within **10 seconds** or they mark the delivery as failed and retry. LLM inference for a non-trivial diff takes 15–60 seconds on CPU. Handling the review synchronously inside the webhook handler would cause consistent timeout failures and duplicate processing on GitHub's retry attempts.
+
+Model inference and GitHub API operations can outlast a webhook request. Running them synchronously would couple delivery acknowledgement to provider latency and availability. GitHub does not automatically redeliver failed webhook deliveries; operators need to inspect failures and redeliver as needed.
 
 ## Decision
-Acknowledge the webhook immediately with `202 Accepted`, then enqueue the review job to a **Celery** worker backed by **Redis**.
 
-The webhook handler:
-1. Validates HMAC signature
-2. Extracts PR metadata
-3. Enqueues a `review_pr` Celery task
-4. Returns `202` to GitHub within ~50ms
+Validate the signature, bound and validate the payload, claim the repository/PR/SHA in Redis, and enqueue a Celery task. Return `202 Accepted` only after dispatch succeeds. Redis or dispatch failures return 503; duplicate claims return 200.
 
-The Celery worker:
-1. Picks up the job from Redis
-2. Runs the full LangGraph review pipeline
-3. Posts results to GitHub API
+The worker fetches the diff, invokes the review graph, and publishes GitHub review/status updates. Celery retries exceptions up to three times with backoff. Late acknowledgement and rejection on worker loss support recovery but do not guarantee exactly-once execution.
 
 ## Consequences
 
-**Gained:**
-- Webhook handler always responds within GitHub's 10s window
-- Natural retry mechanism — Celery retries failed jobs with exponential backoff
-- Worker concurrency is independently scalable from the API layer
-- Job queue depth is a Prometheus metric — observable backpressure
-- Redis doubles as the rate-limiter store (one dependency, two uses)
+- API acknowledgement is independent of model inference, though Redis/broker outages can still delay it.
+- API and worker can scale independently. The Compose pilot explicitly uses one worker process and limits prefetch to one task per process.
+- Redis stores queued jobs, task results, and one-hour duplicate claims. It is not a configured rate limiter.
+- Redis and workers add operational complexity. Persistence, backup/restore, queue recovery, and concurrent publication require live validation.
+- Queue depth and worker metrics are not exposed by the current API metrics endpoint. Optional Flower helps inspect Celery tasks but must stay private.
 
-**Trade-offs:**
-- Adds operational complexity: Redis and at least one Celery worker must be running
-- Review results are not immediate — there's a queue delay under load
-- Debugging requires checking both the API logs and the worker logs
+Compose persists Redis data and keeps service ports on localhost. [Deployment guidance](../deployment.md) describes the operational checks still needed.
 
-**Mitigation:**
-`docker-compose.yml` starts Redis, the API, and a Celery worker together. `make up` gives a fully working stack in one command. The `flower` Celery dashboard is included for job monitoring at `localhost:5555`.
+## Reference
+
+[GitHub: handling failed webhook deliveries](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries).

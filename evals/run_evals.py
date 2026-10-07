@@ -1,213 +1,160 @@
-#!/usr/bin/env python3
-"""
-Evaluation runner for the AI Code Review Agent.
+"""Evaluate example diffs with real inference and no GitHub reads or writes.
 
-Loads evals/golden_set.jsonl, runs the LangGraph agent on each diff,
-and measures true positive rate, false positive rate, and parse success rate.
-
-Usage:
-    python evals/run_evals.py
-    python evals/run_evals.py --backend groq
-    python evals/run_evals.py --output evals/results/run_001.json
+Run `python -m evals.run_evals --backend ollama`. Hosted calls may incur costs.
+Pattern scoring is illustrative and does not establish production accuracy.
 """
+
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import math
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-import structlog
+from src.agent.graph import build_graph
+from src.agent.models import RepoContext, ReviewComment
+from src.agent.nodes.diff_parser import _parse_diff
+from src.agent.state import ReviewState
+from src.config import settings
 
-log = structlog.get_logger()
-
-GOLDEN_SET_PATH = Path("evals/golden_set.jsonl")
-RESULTS_DIR = Path("evals/results")
+GOLDEN_SET_PATH = Path(__file__).with_name("golden_set.jsonl")
 
 
-def load_golden_set() -> list[dict]:
-    """Load all entries from the golden set JSONL file.
-
-    Returns:
-        List of golden-set dicts, one per line.
-    """
-    entries: list[dict] = []
-    with open(GOLDEN_SET_PATH) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                entries.append(json.loads(line))
+def load_golden_set() -> list[dict[str, Any]]:
+    with GOLDEN_SET_PATH.open(encoding="utf-8") as dataset:
+        entries = [json.loads(line) for line in dataset if line.strip()]
+    if not entries:
+        raise ValueError("Evaluation dataset is empty")
     return entries
 
 
-async def run_single(entry: dict) -> dict:
-    """Run the agent on a single golden set entry and return metrics.
+def fixture_diff(entry: dict[str, Any]) -> str:
+    """Add explicit paths to legacy bare hunks before production parsing."""
+    diff: str = entry["diff"]
+    if diff.startswith("@@"):
+        paths = {issue["file"] for issue in entry.get("expected_issues", [])}
+        if len(paths) > 1:
+            raise ValueError("A bare hunk cannot represent multiple files")
+        path = next(iter(paths), "example.py")
+        diff = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n{diff}"
+    if not _parse_diff(diff):
+        raise ValueError("Evaluation fixture has no reviewable hunks")
+    return diff
 
-    Args:
-        entry: A golden-set dict containing ``id``, ``diff``,
-               ``expected_issues``, and ``expected_clean``.
 
-    Returns:
-        A result dict with TP/FP/FN counts, latency, and parse status.
-    """
-    from src.agent.graph import review_graph  # local import avoids circular refs
+def score_comments(expected: list[dict[str, Any]], comments: list[ReviewComment]) -> dict[str, int]:
+    """Match expectations to distinct comments; extra comments are false positives."""
+    matches: dict[int, int] = {}
 
+    def assign(issue_index: int, visited: set[int]) -> bool:
+        issue = expected[issue_index]
+        for index, comment in enumerate(comments):
+            if index in visited or not (
+                comment.file_path == issue["file"]
+                and comment.line == issue["line"]
+                and comment.severity == issue["severity"]
+                and re.search(issue["pattern"], comment.message, re.IGNORECASE)
+            ):
+                continue
+            visited.add(index)
+            if index not in matches or assign(matches[index], visited):
+                matches[index] = issue_index
+                return True
+        return False
+
+    for issue_index in range(len(expected)):
+        assign(issue_index, set())
+    tp = len(matches)
+    return {"tp": tp, "fn": len(expected) - tp, "fp": len(comments) - tp}
+
+
+async def run_single(entry: dict[str, Any], graph: Any) -> dict[str, Any]:
     start = time.perf_counter()
+    result: dict[str, Any] = {
+        "id": entry["id"],
+        "description": entry["description"],
+        "expected_count": len(entry.get("expected_issues", [])),
+    }
     try:
-        state: dict = {
-            "owner": "eval-org",
-            "repo": "eval-repo",
-            "pr_number": 0,
-            "pr_sha": "eval000",
-            "installation_id": None,
-            "raw_diff": entry["diff"],
-            "retry_count": 0,
-            "error": None,
-            # Provide minimal context — context_fetcher node handles None gracefully
-            "repo_context": {
-                "language": None,
-                "readme_excerpt": None,
-                "file_tree": [],
-            },
-        }
-        final = await review_graph.ainvoke(state)
-        comments = final.get("review_comments", [])
-        latency = time.perf_counter() - start
-
-        # ── scoring ─────────────────────────────────────────────────────
-        expected = entry.get("expected_issues", [])
-        expected_clean = entry.get("expected_clean", False)
-
-        matched: list[bool] = []
-        for expected_issue in expected:
-            pattern = expected_issue.get("pattern", "")
-            found = any(
-                re.search(pattern, c.message, re.IGNORECASE)
-                for c in comments
-            )
-            matched.append(found)
-
-        tp = sum(matched)
-        fn = len(matched) - tp
-        fp = (
-            len(comments)
-            if expected_clean
-            else max(0, len(comments) - len(expected))
-        )
-
-        return {
-            "id": entry["id"],
-            "description": entry["description"],
-            "tp": tp,
-            "fn": fn,
-            "fp": fp,
-            "comment_count": len(comments),
-            "expected_count": len(expected),
-            "parse_success": True,
-            "latency_s": round(latency, 2),
-            "severity": final.get("severity", "unknown"),
-        }
-
+        state: ReviewState = {"raw_diff": fixture_diff(entry), "repo_context": RepoContext()}
+        final = await graph.ainvoke(state)
+        comments = final["review_comments"]
+        result.update(score_comments(entry.get("expected_issues", []), comments))
+        result.update(run_success=True, comment_count=len(comments), severity=final["severity"])
     except Exception as exc:
-        latency = time.perf_counter() - start
-        log.exception("eval.entry_failed", entry_id=entry["id"], error=str(exc))
-        return {
-            "id": entry["id"],
-            "description": entry.get("description", ""),
-            "tp": 0,
-            "fn": len(entry.get("expected_issues", [])),
-            "fp": 0,
-            "comment_count": 0,
-            "expected_count": len(entry.get("expected_issues", [])),
-            "parse_success": False,
-            "latency_s": round(latency, 2),
-            "severity": "error",
-            "error": str(exc),
-        }
+        result.update(
+            tp=0,
+            fn=result["expected_count"],
+            fp=0,
+            run_success=False,
+            comment_count=0,
+            severity="error",
+            error=str(exc),
+        )
+    result["latency_s"] = time.perf_counter() - start
+    return result
 
 
-async def main(output_path: Path) -> None:
-    """Load golden set, run every entry through the agent, print & save results.
-
-    Args:
-        output_path: Where to write the JSON results file.
-    """
-    entries = load_golden_set()
-    print(f"Running evals on {len(entries)} golden set entries...\n")
-
-    results: list[dict] = []
-    for entry in entries:
-        print(f"  [{entry['id']}] {entry['description']}...", end=" ", flush=True)
-        result = await run_single(entry)
-        results.append(result)
-        status = "\u2705" if result["parse_success"] else "\u274c"
-        print(f"{status} ({result['latency_s']}s)")
-
-    # ── aggregate metrics ────────────────────────────────────────────────
-    total_expected = sum(r["expected_count"] for r in results)
-    total_tp = sum(r["tp"] for r in results)
-    total_fp = sum(r["fp"] for r in results)
-    total_fn = sum(r["fn"] for r in results)
-    parse_successes = sum(1 for r in results if r["parse_success"])
-    mean_latency = sum(r["latency_s"] for r in results) / len(results)
-
-    tpr = total_tp / total_expected if total_expected > 0 else 0.0
-    fpr = total_fp / len(results) if results else 0.0
-    parse_rate = parse_successes / len(results) if results else 0.0
-
-    summary = {
-        "run_at": datetime.now(timezone.utc).isoformat(),
-        "entry_count": len(entries),
-        "true_positive_rate": round(tpr, 3),
-        "false_positive_rate": round(fpr, 3),
-        "parse_success_rate": round(parse_rate, 3),
-        "mean_latency_s": round(mean_latency, 2),
+def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
+    if not results:
+        raise ValueError("No evaluation results")
+    tp, fp, fn = (sum(row[key] for row in results) for key in ("tp", "fp", "fn"))
+    recall = tp / (tp + fn) if tp + fn else 1.0
+    precision = tp / (tp + fp) if tp + fp else 1.0
+    success_rate = sum(row["run_success"] for row in results) / len(results)
+    latencies = sorted(row["latency_s"] for row in results)
+    p95 = latencies[math.ceil(0.95 * len(latencies)) - 1]
+    return {
+        "run_at": datetime.now(UTC).isoformat(),
+        "provider": settings.llm_provider,
+        "model": getattr(settings, f"{settings.llm_provider}_model"),
+        "entry_count": len(results),
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "recall": recall,
+        "precision": precision,
+        "run_success_rate": success_rate,
+        "mean_latency_s": sum(latencies) / len(latencies),
+        "latency_p95_s": p95,
         "targets": {
-            "tpr_min": 0.70,
-            "fpr_max": 0.15,
-            "parse_rate_min": 0.98,
+            "recall_min": 0.70,
+            "precision_min": 0.85,
+            "run_success_rate_min": 0.98,
             "latency_p95_max_s": 30,
         },
-        "passed": tpr >= 0.70 and fpr <= 0.15 and parse_rate >= 0.98,
+        "passed": recall >= 0.70 and precision >= 0.85 and success_rate >= 0.98 and p95 <= 30,
         "entries": results,
     }
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(summary, indent=2))
 
-    # ── print summary ────────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("EVAL RESULTS")
-    print("=" * 60)
-    ok = "\u2705"
-    fail = "\u274c"
-    print(
-        f"  True Positive Rate:  {tpr:.1%}  (target \u2265 70%)   "
-        f"{ok if tpr >= 0.70 else fail}"
-    )
-    print(
-        f"  False Positive Rate: {fpr:.1%}  (target \u2264 15%)   "
-        f"{ok if fpr <= 0.15 else fail}"
-    )
-    print(
-        f"  Parse Success Rate:  {parse_rate:.1%}  (target \u2265 98%)   "
-        f"{ok if parse_rate >= 0.98 else fail}"
-    )
-    print(f"  Mean Latency:        {mean_latency:.1f}s")
-    passed_str = f"PASSED {ok}" if summary["passed"] else f"FAILED {fail}"
-    print(f"\n  Overall: {passed_str}")
-    print(f"  Results saved to: {output_path}")
+async def main(output_path: Path) -> bool:
+    graph = build_graph(fetch_context=False)
+    results = []
+    for entry in load_golden_set():
+        result = await run_single(entry, graph)
+        results.append(result)
+        print(f"{entry['id']}: {'completed' if result['run_success'] else 'failed'}")
+    summary = summarize(results)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps({key: value for key, value in summary.items() if key != "entries"}, indent=2))
+    print(f"Results saved to {output_path}")
+    return bool(summary["passed"])
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run golden set evals")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=Path("evals/results/latest.json"))
     parser.add_argument(
-        "--output",
-        default="evals/results/latest.json",
-        help="Output JSON path",
+        "--backend", choices=["groq", "ollama", "openai", "anthropic", "openrouter"]
     )
     args = parser.parse_args()
-    asyncio.run(main(Path(args.output)))
+    if args.backend:
+        settings.llm_provider = args.backend
+    raise SystemExit(0 if asyncio.run(main(args.output)) else 1)

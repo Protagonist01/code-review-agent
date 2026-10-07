@@ -42,9 +42,12 @@ WEBHOOK_ERRORS = Counter(
     ["error_type"],
 )
 
+WEBHOOK_REQUESTS = Counter("webhook_requests_total", "Total received webhook requests")
+REVIEWS_COMPLETED = Counter("reviews_completed_total", "Successfully completed reviews")
+
 # ── Concurrency ───────────────────────────────────────────────────────────────
 
 ACTIVE_REVIEWS = Gauge(
     "active_reviews",
-    "Number of review jobs currently in-flight across all workers",
+    "Number of review jobs in-flight in this process",
 )

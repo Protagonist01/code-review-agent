@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 from typing import Any
 
 import structlog
 from fastapi import APIRouter, HTTPException, Request, Response
+from starlette.concurrency import run_in_threadpool
 
-from src.api.metrics import WEBHOOK_ERRORS
+from src.api.metrics import WEBHOOK_ERRORS, WEBHOOK_REQUESTS
 from src.config import settings
 from src.worker import review_pr
 
@@ -56,8 +58,8 @@ def verify_github_signature(payload: bytes, signature_header: str | None) -> boo
         payload,
         hashlib.sha256,
     ).hexdigest()
-    provided = signature_header[len("sha256="):]
-    return hmac.compare_digest(expected, provided)
+    provided = signature_header[len("sha256=") :]
+    return hmac.compare_digest(expected.encode("ascii"), provided.encode("utf-8"))
 
 
 # ── Route ─────────────────────────────────────────────────────────────────────
@@ -75,7 +77,14 @@ async def github_webhook(request: Request) -> Response:
     Raises:
         HTTPException: With status 403 on signature failure.
     """
-    payload_bytes = await request.body()
+    WEBHOOK_REQUESTS.inc()
+    payload = bytearray()
+    async for chunk in request.stream():
+        payload.extend(chunk)
+        if len(payload) > settings.max_webhook_bytes:
+            WEBHOOK_ERRORS.labels(error_type="payload_too_large").inc()
+            raise HTTPException(status_code=413, detail="Webhook payload too large")
+    payload_bytes = bytes(payload)
 
     # ── HMAC auth ─────────────────────────────────────────────────────────────
     sig = request.headers.get("X-Hub-Signature-256")
@@ -93,19 +102,37 @@ async def github_webhook(request: Request) -> Response:
         log.info("webhook.ignored_event", event_type=event_type or "unknown")
         return Response(content="Event ignored", status_code=200)
 
-    payload: dict[str, Any] = await request.json()
-    action: str = payload.get("action", "")
-    if action not in {"opened", "synchronize", "reopened"}:
+    try:
+        data: dict[str, Any] = json.loads(payload_bytes)
+        if not isinstance(data, dict):
+            raise ValueError("Expected an object")
+    except ValueError as exc:
+        WEBHOOK_ERRORS.labels(error_type="invalid_payload").inc()
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+    action: str = data.get("action", "")
+    if not isinstance(action, str) or action not in {"opened", "synchronize", "reopened"}:
         log.info("webhook.ignored_action", event_type=event_type, action=action or "unknown")
         return Response(content="Action ignored", status_code=200)
 
     # ── Extract PR metadata ───────────────────────────────────────────────────
-    pr = payload["pull_request"]
-    pr_number: int = pr["number"]
-    pr_sha: str = pr["head"]["sha"]
-    owner: str = payload["repository"]["owner"]["login"]
-    repo: str = payload["repository"]["name"]
-    installation_id: int | None = payload.get("installation", {}).get("id")
+    try:
+        pr = data["pull_request"]
+        pr_number: int = pr["number"]
+        pr_sha: str = pr["head"]["sha"]
+        owner: str = data["repository"]["owner"]["login"]
+        repo: str = data["repository"]["name"]
+        installation_id: int | None = data.get("installation", {}).get("id")
+        if not all(isinstance(value, str) and value for value in (owner, repo, pr_sha)):
+            raise TypeError("Invalid identifiers")
+        if type(pr_number) is not int or pr_number < 1:
+            raise TypeError("Invalid PR number")
+        if installation_id is not None and (
+            type(installation_id) is not int or installation_id < 1
+        ):
+            raise TypeError("Invalid installation")
+    except (KeyError, TypeError, AttributeError) as exc:
+        WEBHOOK_ERRORS.labels(error_type="invalid_payload").inc()
+        raise HTTPException(status_code=400, detail="Invalid PR payload") from exc
 
     log.info(
         "webhook.received",
@@ -120,19 +147,28 @@ async def github_webhook(request: Request) -> Response:
     from src.api.app import get_redis  # local import avoids circular dependency
 
     redis = get_redis()
-    dedup_key = f"review:{owner}:{repo}:{pr_sha}"
-    if await redis.exists(dedup_key):
-        log.info("webhook.deduplicated", dedup_key=dedup_key)
+    dedup_key = f"review:{owner}:{repo}:{pr_number}:{pr_sha}"
+    try:
+        claimed = await redis.set(dedup_key, "1", nx=True, ex=3600)
+    except Exception as exc:
+        WEBHOOK_ERRORS.labels(error_type="redis_unavailable").inc()
+        raise HTTPException(status_code=503, detail="Queue unavailable") from exc
+    if not claimed:
         return Response(content="Already queued", status_code=200)
-    await redis.setex(dedup_key, 3600, "1")  # expire after 1 h
-
-    # ── Enqueue review task ───────────────────────────────────────────────────
-    review_pr.delay(
-        owner=owner,
-        repo=repo,
-        pr_number=pr_number,
-        pr_sha=pr_sha,
-        installation_id=installation_id,
-    )
-
+    try:
+        await run_in_threadpool(
+            review_pr.delay,
+            owner=owner,
+            repo=repo,
+            pr_number=pr_number,
+            pr_sha=pr_sha,
+            installation_id=installation_id,
+        )
+    except Exception as exc:
+        WEBHOOK_ERRORS.labels(error_type="dispatch_failure").inc()
+        try:
+            await redis.delete(dedup_key)
+        except Exception:
+            log.exception("webhook.claim_release_failed")
+        raise HTTPException(status_code=503, detail="Queue unavailable") from exc
     return Response(content="Review enqueued", status_code=202)

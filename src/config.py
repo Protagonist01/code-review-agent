@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,6 +14,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        env_ignore_empty=True,
     )
 
     # ── GitHub App ─────────────────────────────────────────────────────────────
@@ -24,9 +25,7 @@ class Settings(BaseSettings):
     github_token: str | None = None
 
     # ── LLM Backend ────────────────────────────────────────────────────────────
-    llm_provider: Literal["groq", "ollama", "openai", "anthropic", "openrouter"] = (
-        "openrouter"
-    )
+    llm_provider: Literal["groq", "ollama", "openai", "anthropic", "openrouter"] = "openrouter"
 
     groq_api_key: str | None = None
     groq_model: str = "llama-3.3-70b-versatile"
@@ -54,8 +53,9 @@ class Settings(BaseSettings):
     api_port: int = 8000
 
     # ── Review Policy ──────────────────────────────────────────────────────────
-    # Diffs larger than this are summarised and skipped
-    max_diff_lines: int = 1500
+    # Larger diffs fail explicitly rather than producing a clean result.
+    max_diff_lines: int = Field(default=1500, ge=1)
+    max_webhook_bytes: int = Field(default=2_000_000, ge=1)
     # Comments below this severity threshold are not posted
     min_comment_severity: Literal["info", "warning", "error"] = "warning"
 

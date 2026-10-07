@@ -50,6 +50,14 @@ def parse_llm_response(raw: str, hunk: DiffHunk) -> list[ReviewComment]:
         A list of valid :class:`ReviewComment` instances (may be empty).
     """
     comments: list[ReviewComment] = []
+    valid_lines: set[int] = set()
+    current_line = hunk.start_line
+    for diff_line in hunk.content.splitlines():
+        if diff_line.startswith(("@@", "\\", "-")):
+            continue
+        if diff_line.startswith(("+", " ")):
+            valid_lines.add(current_line)
+            current_line += 1
 
     for raw_line in raw.splitlines():
         line = raw_line.strip()
@@ -83,6 +91,9 @@ def parse_llm_response(raw: str, hunk: DiffHunk) -> list[ReviewComment]:
             line_number = int(parts[1].strip())
         except ValueError:
             log.debug("response_parser.skip_non_int_line", raw_line_number=parts[1].strip())
+            continue
+
+        if file_path != hunk.file_path or line_number not in valid_lines:
             continue
 
         if line_number < 1:
