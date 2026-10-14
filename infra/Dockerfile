@@ -1,5 +1,5 @@
 FROM ghcr.io/astral-sh/uv:0.11.1 AS uv
-FROM python:3.11-slim AS builder
+FROM python:3.14-slim AS builder
 
 COPY --from=uv /uv /usr/local/bin/uv
 WORKDIR /app
@@ -7,7 +7,7 @@ COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
 RUN uv sync --locked --no-dev --no-editable --no-cache
 
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
