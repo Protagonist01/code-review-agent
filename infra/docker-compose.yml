@@ -103,7 +103,7 @@ services:
   # ── Prometheus ─────────────────────────────────────────────────────────────
   prometheus:
     profiles: [monitoring]
-    image: prom/prometheus:v3.15.0
+    image: prom/prometheus:v3.15.1
     container_name: cra-prometheus
     restart: unless-stopped
     volumes:
